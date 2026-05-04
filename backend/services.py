@@ -32,6 +32,19 @@ class IntelligenceProvider:
         context["mode"] = "live_best_effort"
         live_facts: List[EvidenceItem] = []
         apollo_people = await self._apollo_people(context.get("company_domain", ""))
+        site_context = await self._scrape_company_site(context.get("company_website", ""))
+        if site_context:
+            context["site_context"] = site_context
+            context["public_contact_signals"] = self._extract_public_contact_signals(site_context)
+            live_facts.append(
+                EvidenceItem(
+                    title=f"{company_name} public website",
+                    snippet=site_context.get("summary", "") or "Public website content was collected for source-backed contact and company signals.",
+                    source_url=site_context.get("source_url", ""),
+                    source_type="website",
+                    confidence=0.76,
+                )
+            )
         live_news = await self._fetch_news(company_name)
         if live_news:
             context["news"] = live_news
@@ -57,8 +70,14 @@ class IntelligenceProvider:
         context["sentiment"] = self._sentiment_summary(context["evidence"])
         return context
 
-    async def enrich_contacts(self, decision_makers: List[DecisionMaker], company_domain: str) -> List[ContactRecord]:
+    async def enrich_contacts(
+        self,
+        decision_makers: List[DecisionMaker],
+        company_domain: str,
+        public_contact_signals: Dict[str, Any] | None = None,
+    ) -> List[ContactRecord]:
         contacts: List[ContactRecord] = []
+        public_contact_signals = public_contact_signals or {}
         apollo_matches = await self._apollo_people(company_domain) if company_domain else []
         apollo_lookup = {
             self._normalize_name(item.get("name", "")): item
@@ -123,6 +142,11 @@ class IntelligenceProvider:
                     verification_notes=notes,
                 )
             )
+
+        if not any(contact.overall_status != "not_found" for contact in contacts):
+            public_contact = self._public_contact_record(public_contact_signals)
+            if public_contact:
+                contacts.insert(0, public_contact)
 
         return contacts
 
@@ -261,6 +285,35 @@ class IntelligenceProvider:
         except Exception:
             return []
 
+    async def _scrape_company_site(self, website_url: str) -> Dict[str, Any]:
+        if not self.settings.firecrawl_api_key or not website_url:
+            return {}
+        payload = {
+            "url": website_url,
+            "formats": ["markdown"],
+            "onlyMainContent": False,
+            "timeout": self.settings.request_timeout_seconds * 1000,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.settings.firecrawl_api_key}",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self.settings.request_timeout_seconds) as client:
+                response = await client.post("https://api.firecrawl.dev/v1/scrape", json=payload, headers=headers)
+                response.raise_for_status()
+                data = response.json().get("data", {})
+                markdown = data.get("markdown", "") or ""
+                metadata = data.get("metadata", {}) or {}
+                return {
+                    "source_url": data.get("url", "") or website_url,
+                    "title": metadata.get("title", "") or data.get("title", ""),
+                    "markdown": markdown[:18000],
+                    "summary": self._compact_text(markdown, 420),
+                }
+        except Exception:
+            return {}
+
     async def _apollo_people(self, domain: str) -> List[Dict[str, Any]]:
         self.last_apollo_error = ""
         if not self.settings.apollo_api_key or not domain:
@@ -300,6 +353,52 @@ class IntelligenceProvider:
             return ContactField(value=value, status="verified", confidence=0.85, source=source, trust_state="verified")
         return ContactField()
 
+    def _extract_public_contact_signals(self, site_context: Dict[str, Any]) -> Dict[str, Any]:
+        markdown = site_context.get("markdown", "")
+        source_url = site_context.get("source_url", "")
+        emails = []
+        for email in re.findall(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", markdown, flags=re.IGNORECASE):
+            normalized = email.strip().lower()
+            if normalized not in emails and not normalized.endswith((".png", ".jpg", ".jpeg", ".webp")):
+                emails.append(normalized)
+
+        linkedin_urls = []
+        for url in re.findall(r"https?://(?:www\.)?linkedin\.com/[^\s)>\]\"']+", markdown, flags=re.IGNORECASE):
+            cleaned = url.rstrip(".,;")
+            if cleaned not in linkedin_urls:
+                linkedin_urls.append(cleaned)
+
+        return {
+            "emails": emails[:5],
+            "linkedin_urls": linkedin_urls[:5],
+            "source_url": source_url,
+        }
+
+    def _public_contact_record(self, signals: Dict[str, Any]) -> ContactRecord | None:
+        email_value = self._first_text(*signals.get("emails", []))
+        linkedin_value = self._first_text(*signals.get("linkedin_urls", []))
+        if not email_value and not linkedin_value:
+            return None
+
+        email = self._verified_field(email_value, "public_company_source")
+        linkedin = self._verified_field(linkedin_value, "public_company_source")
+        overall_status = "verified_contactable" if email.status == "verified" else "verified_partial"
+        notes = []
+        if email.status == "verified":
+            notes.append("A public company source listed this email address.")
+        if linkedin.status == "verified":
+            notes.append("A public company source listed this profile URL.")
+
+        return ContactRecord(
+            person_name="Public company contact",
+            role_title="Published company contact route",
+            email=email,
+            phone=ContactField(),
+            linkedin_url=linkedin,
+            overall_status=overall_status,
+            verification_notes=notes,
+        )
+
     def _decision_person_from_apollo(self, person: Dict[str, Any], category_description: str) -> Dict[str, Any]:
         title = self._first_text(person.get("title"), "Marketing stakeholder")
         return {
@@ -336,6 +435,12 @@ class IntelligenceProvider:
             if isinstance(value, str) and value.strip():
                 return value.strip()
         return ""
+
+    def _compact_text(self, value: str, limit: int) -> str:
+        text = re.sub(r"\s+", " ", value).strip()
+        if len(text) <= limit:
+            return text
+        return f"{text[:limit].rstrip()}..."
 
     def _first_phone_number(self, person: Dict[str, Any]) -> str:
         for key in ["phone_numbers", "phones", "contact_phone_numbers"]:

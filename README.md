@@ -117,7 +117,7 @@ The smoke test runs the pipeline across multiple industries and checks that the 
 
 ## Contact Intelligence Policy
 
-The system only shows contact fields when a verified source returns concrete data. If no verified source returns an email, phone number, or profile URL, the field remains blank and is marked as `not_found`.
+The system only shows contact fields when a verified source returns concrete data. In live mode, it first attempts enrichment and then falls back to public company-source discovery from the target website. If no verified source returns an email, phone number, or profile URL, the field remains blank and is marked as `not_found`.
 
 Example:
 

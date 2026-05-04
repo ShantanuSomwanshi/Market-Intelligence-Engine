@@ -11,6 +11,7 @@ async def run(state: RunState) -> RunState:
     contacts = await provider.enrich_contacts(
         decision_makers,
         state.research_context.get("company_domain", ""),
+        state.research_context.get("public_contact_signals", {}),
     )
     set_report_section(state, "contact_intelligence", [item.model_dump() for item in contacts])
     return state
