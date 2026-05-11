@@ -119,6 +119,20 @@ The smoke test runs the pipeline across multiple industries and checks that the 
 
 The system only shows contact fields when a verified source returns concrete data. In live mode, it first attempts enrichment and then falls back to public company-source discovery from the target website. If no verified source returns an email, phone number, or profile URL, the field remains blank and is marked as `not_found`.
 
+For Apollo-backed people search, use a master API key that has access to the official People API Search endpoint:
+
+```text
+POST https://api.apollo.io/api/v1/mixed_people/api_search
+```
+
+Apollo People Search finds people but does not directly return emails or phone numbers. The backend follows it with Bulk People Enrichment:
+
+```text
+POST https://api.apollo.io/api/v1/people/bulk_match
+```
+
+If Apollo returns `403`, replace `APOLLO_API_KEY` with a master/API-enabled key, set `USE_MOCK_DATA=false`, and restart the backend.
+
 Example:
 
 ```json

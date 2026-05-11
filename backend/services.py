@@ -78,7 +78,8 @@ class IntelligenceProvider:
     ) -> List[ContactRecord]:
         contacts: List[ContactRecord] = []
         public_contact_signals = public_contact_signals or {}
-        apollo_matches = await self._apollo_people(company_domain) if company_domain else []
+        apollo_search_results = await self._apollo_people(company_domain) if company_domain else []
+        apollo_matches = await self._apollo_enrich_people(apollo_search_results, company_domain)
         apollo_lookup = {
             self._normalize_name(item.get("name", "")): item
             for item in apollo_matches
@@ -97,12 +98,14 @@ class IntelligenceProvider:
             linkedin_value = self._first_text(
                 apollo_hit.get("linkedin_url"),
                 apollo_hit.get("linkedin"),
+                apollo_hit.get("raw", {}).get("linkedin_url") if isinstance(apollo_hit.get("raw"), dict) else "",
                 person.source_url if "linkedin.com" in person.source_url else "",
             )
             email_value = self._first_text(
                 apollo_hit.get("email"),
                 apollo_hit.get("email_address"),
                 apollo_hit.get("personal_email"),
+                apollo_hit.get("raw", {}).get("email") if isinstance(apollo_hit.get("raw"), dict) else "",
                 apollo_hit.get("organization", {}).get("primary_email") if isinstance(apollo_hit.get("organization"), dict) else "",
             )
             phone_value = self._first_text(
@@ -110,6 +113,7 @@ class IntelligenceProvider:
                 apollo_hit.get("phone_number"),
                 apollo_hit.get("sanitized_phone"),
                 self._first_phone_number(apollo_hit),
+                self._first_phone_number(apollo_hit.get("raw", {})) if isinstance(apollo_hit.get("raw"), dict) else "",
             )
 
             email = self._verified_field(email_value, "verified_enrichment")
@@ -319,34 +323,163 @@ class IntelligenceProvider:
         if not self.settings.apollo_api_key or not domain:
             self.last_apollo_error = "Apollo key or company domain is missing."
             return []
-        payload = {
-            "q_organization_domains_list": [domain],
-            "person_titles": ["marketing", "brand", "growth", "founder", "chief marketing officer"],
-            "page": 1,
-            "per_page": 5,
+
+        params = self._apollo_search_params(domain)
+        try:
+            async with httpx.AsyncClient(timeout=self.settings.request_timeout_seconds) as client:
+                response = await client.post(
+                    "https://api.apollo.io/api/v1/mixed_people/api_search",
+                    params=params,
+                    headers=self._apollo_headers(),
+                )
+                if response.status_code == 403:
+                    self.last_apollo_error = "Apollo People Search requires a master API key."
+                    return []
+                if response.status_code >= 400:
+                    self.last_apollo_error = f"HTTP {response.status_code} from Apollo People Search."
+                    return []
+                data = response.json()
+                return [self._normalize_apollo_person(item) for item in data.get("people", [])]
+        except Exception as exc:
+            self.last_apollo_error = str(exc)
+        return []
+
+    async def _apollo_enrich_people(self, people: List[Dict[str, Any]], domain: str) -> List[Dict[str, Any]]:
+        if not people:
+            return []
+
+        details = []
+        for person in people[:10]:
+            detail = {}
+            if person.get("id"):
+                detail["id"] = person["id"]
+            elif person.get("name"):
+                detail["name"] = person["name"]
+                detail["domain"] = domain
+            if detail:
+                details.append(detail)
+
+        if not details:
+            return people
+
+        try:
+            async with httpx.AsyncClient(timeout=self.settings.request_timeout_seconds) as client:
+                response = await client.post(
+                    "https://api.apollo.io/api/v1/people/bulk_match",
+                    params={
+                        "reveal_personal_emails": "false",
+                        "reveal_phone_number": "false",
+                    },
+                    json={"details": details},
+                    headers=self._apollo_headers(),
+                )
+                if response.status_code >= 400:
+                    return people
+                data = response.json()
+                enriched_people = self._extract_apollo_enrichment_people(data)
+        except Exception:
+            return people
+
+        enriched_by_id = {
+            item.get("id"): item
+            for item in enriched_people
+            if item.get("id")
         }
-        headers = {
+        enriched_by_name = {
+            self._normalize_name(item.get("name", "")): item
+            for item in enriched_people
+            if item.get("name")
+        }
+
+        merged = []
+        for person in people:
+            enriched = enriched_by_id.get(person.get("id")) or enriched_by_name.get(self._normalize_name(person.get("name", ""))) or {}
+            merged.append(self._merge_apollo_person(person, enriched))
+        return merged
+
+    def _apollo_headers(self) -> Dict[str, str]:
+        return {
+            "accept": "application/json",
             "Content-Type": "application/json",
             "X-Api-Key": self.settings.apollo_api_key,
             "Cache-Control": "no-cache",
         }
-        endpoints = [
-            "https://api.apollo.io/api/v1/people/search",
-            "https://api.apollo.io/v1/people/search",
+
+    def _apollo_search_params(self, domain: str) -> List[tuple[str, str]]:
+        titles = [
+            "chief marketing officer",
+            "head of marketing",
+            "vp marketing",
+            "marketing director",
+            "brand marketing",
+            "growth marketing",
+            "demand generation",
+            "founder",
         ]
-        for endpoint in endpoints:
-            try:
-                async with httpx.AsyncClient(timeout=self.settings.request_timeout_seconds) as client:
-                    response = await client.post(endpoint, json=payload, headers=headers)
-                    if response.status_code >= 400:
-                        self.last_apollo_error = f"HTTP {response.status_code} from {endpoint}"
-                        continue
-                    data = response.json()
-                    return data.get("people", []) or data.get("contacts", []) or []
-            except Exception as exc:
-                self.last_apollo_error = str(exc)
+        seniorities = ["c_suite", "vp", "head", "director", "manager", "founder"]
+        params: List[tuple[str, str]] = [
+            ("q_organization_domains_list[]", domain),
+            ("include_similar_titles", "true"),
+            ("page", "1"),
+            ("per_page", "10"),
+        ]
+        params.extend(("person_titles[]", title) for title in titles)
+        params.extend(("person_seniorities[]", seniority) for seniority in seniorities)
+        return params
+
+    def _normalize_apollo_person(self, person: Dict[str, Any]) -> Dict[str, Any]:
+        organization = person.get("organization", {}) if isinstance(person.get("organization"), dict) else {}
+        return {
+            "id": self._first_text(person.get("id"), person.get("person_id")),
+            "name": self._apollo_name(person),
+            "title": self._first_text(person.get("title"), person.get("headline"), "Marketing stakeholder"),
+            "email": self._first_text(person.get("email"), person.get("email_address")),
+            "phone": self._first_text(person.get("phone"), person.get("phone_number"), person.get("sanitized_phone")),
+            "linkedin_url": self._first_text(person.get("linkedin_url"), person.get("linkedin")),
+            "organization_name": self._first_text(organization.get("name"), person.get("organization_name")),
+            "source": "apollo_people_search",
+            "raw": person,
+        }
+
+    def _merge_apollo_person(self, search_person: Dict[str, Any], enriched_person: Dict[str, Any]) -> Dict[str, Any]:
+        merged = dict(search_person)
+        normalized_enriched = self._normalize_apollo_person(enriched_person) if enriched_person else {}
+        for key, value in normalized_enriched.items():
+            if key == "raw":
                 continue
-        return []
+            if value and not merged.get(key):
+                merged[key] = value
+        merged["source"] = "apollo_people_search_and_enrichment" if enriched_person else search_person.get("source", "apollo_people_search")
+        return merged
+
+    def _extract_apollo_enrichment_people(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        candidates = []
+        for key in ["people", "persons", "matches"]:
+            value = payload.get(key)
+            if isinstance(value, list):
+                candidates.extend(item for item in value if isinstance(item, dict))
+        for key in ["person", "match"]:
+            value = payload.get(key)
+            if isinstance(value, dict):
+                candidates.append(value)
+
+        enrichments = payload.get("enrichments")
+        if isinstance(enrichments, list):
+            for item in enrichments:
+                if not isinstance(item, dict):
+                    continue
+                for key in ["person", "matched_person", "details"]:
+                    value = item.get(key)
+                    if isinstance(value, dict):
+                        candidates.append(value)
+                if any(field in item for field in ["id", "name", "email", "linkedin_url"]):
+                    candidates.append(item)
+        return candidates
+
+    def _apollo_name(self, person: Dict[str, Any]) -> str:
+        first = self._first_text(person.get("first_name"))
+        last = self._first_text(person.get("last_name"), person.get("last_name_obfuscated"))
+        return self._first_text(person.get("name"), f"{first} {last}".strip())
 
     def _verified_field(self, value: str | None, source: str) -> ContactField:
         if value:
