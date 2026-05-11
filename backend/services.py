@@ -188,13 +188,22 @@ class IntelligenceProvider:
             return fallback
 
     def derive_decision_roles(self, category_description: str) -> List[DecisionMaker]:
+        text = category_description.lower()
         roles = [
             ("Head of Marketing", "Owns marketing strategy, campaign execution, and agency evaluation."),
             ("Brand Marketing Lead", "Owns brand positioning, launches, and experiential opportunities."),
             ("Growth or Demand Generation Lead", "Relevant when performance marketing and pipeline efficiency matter."),
         ]
-        if any(keyword in category_description.lower() for keyword in ["retail", "consumer", "fashion", "ecommerce"]):
+        if any(keyword in text for keyword in ["crm", "marketing automation", "saas", "software", "platform"]):
+            roles.append(("Product Marketing Lead", "Relevant for positioning, competitive messaging, and launch narratives."))
+        if any(keyword in text for keyword in ["retail", "consumer", "fashion", "ecommerce", "sportswear"]):
             roles.append(("Experiential Marketing Lead", "Relevant for retail activations, launches, and in-person experiences."))
+        if any(keyword in text for keyword in ["event", "exhibition", "booth", "activation", "roadshow", "experiential"]):
+            roles = [
+                ("Head of Business Development", "Likely owner of new brand, event, and agency partnership opportunities."),
+                ("Experiential Marketing Lead", "Relevant for brand activations, roadshows, and live event execution."),
+                ("Brand Partnerships Lead", "Relevant for sponsor, venue, and campaign collaboration opportunities."),
+            ]
         return [DecisionMaker(role_title=role, role_relevance=reason) for role, reason in roles]
 
     def build_outreach(self, company_name: str, person: DecisionMaker, fact_references: List[str], evidence_refs: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -602,12 +611,45 @@ class IntelligenceProvider:
         return "Relevant stakeholder for market positioning and outreach prioritization."
 
     def _safe_domain(self, company_name: str) -> str:
+        known_domains = {
+            "notion": "notion.so",
+            "hubspot": "hubspot.com",
+            "salesforce": "salesforce.com",
+            "shopify": "shopify.com",
+            "apple": "apple.com",
+            "google": "google.com",
+            "nike": "nike.com",
+            "steponexp": "steponexp.com",
+            "steponeexp": "steponexp.com",
+            "stepone": "steponexp.com",
+        }
         slug = re.sub(r"[^a-z0-9]+", "", company_name.lower())
-        return f"{slug}.com" if slug else ""
+        return known_domains.get(slug, f"{slug}.com" if slug else "")
 
     def _profile(self, category_description: str) -> Dict[str, str]:
         text = category_description.lower()
-        if any(term in text for term in ["saas", "software", "platform", "ai", "cloud"]):
+        if any(term in text for term in ["event", "exhibition", "booth", "activation", "roadshow", "experiential"]):
+            return {
+                "business_model": "B2B experiential services and event execution",
+                "positioning": "experience-led and delivery-focused",
+                "message_shift": "proof of execution quality, measurable event outcomes, and brand experience credibility",
+                "competitive_frame": "agency differentiation, production reliability, and portfolio proof",
+            }
+        if any(term in text for term in ["consumer technology", "smartphone", "device", "hardware", "electronics"]):
+            return {
+                "business_model": "consumer technology and services ecosystem",
+                "positioning": "premium ecosystem-led and product-experience driven",
+                "message_shift": "AI-enabled experiences, ecosystem value, and services growth",
+                "competitive_frame": "device ecosystem lock-in, platform differentiation, and premium brand loyalty",
+            }
+        if any(term in text for term in ["search", "advertising", "consumer internet", "internet services"]):
+            return {
+                "business_model": "advertising, cloud, and digital platform ecosystem",
+                "positioning": "scale-led and AI/data-infrastructure driven",
+                "message_shift": "AI leadership, cloud differentiation, and trusted platform utility",
+                "competitive_frame": "AI platform competition, cloud share battles, and advertising budget shifts",
+            }
+        if any(term in text for term in ["crm", "marketing automation", "saas", "software", "platform", "ai", "cloud"]):
             return {
                 "business_model": "B2B SaaS",
                 "positioning": "product-led and efficiency-oriented",
